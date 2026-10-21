@@ -2,11 +2,18 @@
 
 A full stack author support portal and operations dashboard built with Node.js and browser-native JavaScript. It uses a REST API, role-based access, optional server-side Gemini AI, and either a local JSON store for development or Neon Postgres for Vercel deployments.
 
+**Live demo:** [BookLeaf Support Desk](https://bookleaf-support-desk.vercel.app)
+
+**Demo accounts:** listed below. These are shared evaluation credentials, not production credentials.
+
 ## Run locally
 
 Requirements: Node.js 20 or newer.
 
 ```sh
+git clone https://github.com/daniish-ansarii/bookleaf-support-desk.git
+cd bookleaf-support-desk
+npm install
 cp .env.example .env
 # Set SESSION_SECRET to a long random value before using real accounts.
 node server.js
@@ -47,6 +54,27 @@ The assignment mentions an included BookLeaf Knowledge Base, but its contents we
 
 Existing local demo tickets are not automatically migrated. Keep the repository private because it contains company-provided author data.
 
+## Architecture decisions
+
+- **Small Node.js service and browser-native UI:** keeps the assignment easy to run and avoids a frontend build pipeline. `server.js` owns REST handling, authentication, validation, persistence, and Gemini calls; `public/` contains the browser app.
+- **One REST handler on Vercel:** `api/index.js` receives Vercel rewrites for `/api/*` and passes the original API path into the same router used locally. This keeps local and hosted behavior aligned.
+- **Neon Postgres in production, JSON file locally:** Neon keeps tickets and replies across stateless function invocations. The current app stores the complete state as one JSONB record to keep setup and migrations small for the assignment; a production version should normalize users, books, tickets, messages, and notes into relational tables.
+- **Polling instead of a persistent connection:** the author and operations screens refresh tickets every five seconds. This works with serverless functions and is simpler to deploy, at the cost of a short update delay and extra reads.
+- **AI as an assistant, not a dependency:** local rules classify and prioritize a ticket immediately. Gemini can refine those values and draft replies, but admins review drafts and can edit every classification field.
+
+## Known limitations and next steps
+
+- Attachments are a UI-only preview; files are not uploaded or stored.
+- Updates use five-second polling rather than push delivery.
+- The supplied assignment referenced a Knowledge Base, but no policy text was included. The current [knowledge-base.md](knowledge-base.md) explicitly tells the model not to invent BookLeaf policies. Add company-approved guidance before using drafts for real author support.
+- Demo accounts use shared passwords because the input dataset did not contain credentials. Replace these with per-user invitations and password reset before real use.
+- The JSONB single-record store is suitable for a small demo, not high concurrency or detailed reporting. A production evolution should add a normalized schema, migrations, indexes, audit history, and automated backups.
+- Add rate limiting, account recovery, monitoring/alerts, and attachment scanning/storage before production use.
+
+## Submission materials and data handling
+
+The one-page approach note is in [SUBMISSION-WRITEUP.md](SUBMISSION-WRITEUP.md). The assignment requests a public source repository, but this checkout includes company-provided author contact data in `company-authors.json`. Do not make this repository public until the company has approved that disclosure or the data has been replaced with a sanitized fixture. The live demo also contains seeded author data; confirm that the company authorizes evaluator access before sharing its URL and credentials publicly. Add the evaluator's collaborator email when the company provides it.
+
 ## REST API
 
 All API responses are JSON. Login sets the signed HttpOnly session cookie. Protected endpoints return `401` when signed out; authors receive `404` when requesting a ticket they do not own. Invalid input receives a specific `400` message; unknown routes receive `404`.
@@ -81,8 +109,9 @@ Ticket statuses: `Open`, `In Progress`, `Resolved`, `Closed`. Categories: `Royal
 
 - `company-authors.json` — company-provided author and book records. This is outside `public/` and is not served to browsers.
 - `server.js` — local HTTP server, Vercel API handler, REST routes, validation, signed sessions, persistence, and AI provider calls.
-- `api/[...all].js` — Vercel serverless API entry point.
-- `vercel.json` — function duration and region configuration.
+- `api/index.js` — Vercel serverless API entry point; the rewrite forwards all `/api/*` routes here.
+- `vercel.json` — static output, API rewrite, function duration, and region configuration.
 - `public/` — responsive author/admin app.
 - `knowledge-base.md` — server-only context supplied to the draft prompt.
 - `.env.example` — optional server configuration template. Copy it to `.env` and add the newly generated Gemini key there.
+- `SUBMISSION-WRITEUP.md` — concise approach, trade-offs, and production evolution plan.
