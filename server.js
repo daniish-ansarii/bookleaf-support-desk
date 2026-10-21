@@ -2,6 +2,9 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { AsyncLocalStorage } = require('node:async_hooks');
+const { Pool } = require('pg');
+const { waitUntil } = require('@vercel/functions');
 const companyData = require('./company-authors.json');
 
 // Keep secrets in the server-only .env file without adding a package dependency.
@@ -28,8 +31,9 @@ const CATEGORIES = ['Royalty & Payments', 'ISBN & Metadata Issues', 'Printing & 
 const PRIORITIES = ['Critical', 'High', 'Medium', 'Low'];
 const STATUSES = ['Open', 'In Progress', 'Resolved', 'Closed'];
 const GENERAL_BOOK = 'General / Account Level';
-const sessions = new Map();
-const streams = new Map();
+const requestContext = new AsyncLocalStorage();
+const databaseUrl = process.env.DATABASE_URL || process.env.POSTGRES_URL;
+const pool = databaseUrl ? new Pool({ connectionString: databaseUrl, max: 3, ssl: { rejectUnauthorized: false } }) : null;
 
 function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
   return `${salt}:${crypto.scryptSync(password, salt, 64).toString('hex')}`;
@@ -42,8 +46,25 @@ function verifyPassword(password, stored) {
 }
 function now() { return new Date().toISOString(); }
 function uid(prefix) { return `${prefix}_${crypto.randomBytes(6).toString('hex')}`; }
+function createSession(userId) {
+  const payload = Buffer.from(JSON.stringify({ userId, expiresAt: Date.now() + 7 * 86400000 })).toString('base64url');
+  const signature = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
+  return `${payload}.${signature}`;
+}
+function readSession(token) {
+  if (!token || typeof token !== 'string') return null;
+  const [payload, signature] = token.split('.');
+  if (!payload || !signature) return null;
+  const expected = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest();
+  const actual = Buffer.from(signature, 'base64url');
+  if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) return null;
+  try {
+    const session = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    return session.expiresAt > Date.now() ? session : null;
+  } catch { return null; }
+}
 
-function seedStore() {
+function createSeedStore() {
   const adminId = 'usr_admin_demo';
   const authors = companyData.authors || [];
   const data = {
@@ -62,22 +83,35 @@ function seedStore() {
     }))),
     tickets: [], notes: []
   };
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
   return data;
 }
 function loadStore() {
-  if (!fs.existsSync(DB_FILE)) return seedStore();
+  if (!fs.existsSync(DB_FILE)) {
+    const data = createSeedStore();
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
+    return data;
+  }
   try {
     const existing = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-    return existing.schemaVersion === 2 ? existing : seedStore();
-  } catch { return seedStore(); }
+    return existing.schemaVersion === 2 ? existing : createSeedStore();
+  } catch { return createSeedStore(); }
 }
-let store = loadStore();
-function save() {
+const localStore = loadStore();
+const store = new Proxy({}, {
+  get(_target, key) { return requestContext.getStore()?.data?.[key] ?? localStore[key]; },
+  set(_target, key, value) { const context = requestContext.getStore(); if (context) context.data[key] = value; else localStore[key] = value; return true; }
+});
+async function save() {
+  const context = requestContext.getStore();
+  if (context?.client) {
+    await context.client.query('UPDATE bookleaf_state SET payload = $1::jsonb WHERE id = 1', [JSON.stringify(context.data)]);
+    return;
+  }
+  const data = context?.data || localStore;
   fs.mkdirSync(DATA_DIR, { recursive: true });
   const temp = `${DB_FILE}.tmp`;
-  fs.writeFileSync(temp, JSON.stringify(store, null, 2), { mode: 0o600 });
+  fs.writeFileSync(temp, JSON.stringify(data, null, 2), { mode: 0o600 });
   fs.renameSync(temp, DB_FILE);
 }
 const publicUser = ({ passwordHash, ...u }) => u;
@@ -89,12 +123,7 @@ const ticketView = (ticket, user) => {
   return view;
 }
 function publish(ticket) {
-  for (const [res, info] of streams) {
-    if (info.role === 'admin' || info.authorId === ticket.authorId) {
-      const packet = JSON.stringify({ type: 'ticket.updated', ticket: ticketView(ticket, { role: info.role }) });
-      try { res.write(`event: ticket\ndata: ${packet}\n\n`); } catch {}
-    }
-  }
+  // Vercel functions are stateless; the browser uses short-interval polling instead of a long-lived SSE connection.
 }
 function classifyFallback(text) {
   const s = text.toLowerCase();
@@ -171,7 +200,24 @@ async function enrichTicket(ticket) {
     ticket.aiState = 'fallback';
     ticket.aiReason = error.message === 'AI_NOT_CONFIGURED' ? 'Rule-based fallback: AI key is not configured.' : 'Rule-based fallback: AI service was unavailable.';
   }
-  ticket.updatedAt = now(); save(); publish(ticket);
+  const changes = { category: ticket.category, priority: ticket.priority, aiModel: ticket.aiModel, aiReason: ticket.aiReason, aiState: ticket.aiState, updatedAt: now() };
+  if (pool) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await client.query('SELECT payload FROM bookleaf_state WHERE id = 1 FOR UPDATE');
+      const data = result.rows[0]?.payload;
+      const saved = data?.tickets?.find(item => item.id === ticket.id);
+      if (saved) { Object.assign(saved, changes); await client.query('UPDATE bookleaf_state SET payload = $1::jsonb WHERE id = 1', [JSON.stringify(data)]); }
+      await client.query('COMMIT');
+    } catch (error) { await client.query('ROLLBACK'); throw error; }
+    finally { client.release(); }
+  } else {
+    Object.assign(ticket, changes);
+    await save();
+  }
+  Object.assign(ticket, changes);
+  publish(ticket);
 }
 async function draftReply(ticket) {
   const context = (ticket.messages || []).map(m => `${m.senderRole}: ${m.body}`).slice(-6).join('\n');
@@ -200,7 +246,7 @@ function readBody(req) {
 function validString(value, min, max) { return typeof value === 'string' && value.trim().length >= min && value.trim().length <= max; }
 function safeTicket(ticket, user) { return ticketView(ticket, user); }
 
-const server = http.createServer(async (req, res) => {
+async function handleRequest(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const route = url.pathname;
   if (req.method === 'OPTIONS') { res.writeHead(204, { 'Access-Control-Allow-Methods': 'GET,POST,PATCH,DELETE,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' }); return res.end(); }
@@ -212,28 +258,20 @@ const server = http.createServer(async (req, res) => {
         if (!validString(body.email, 3, 254) || !validString(body.password, 1, 200)) return json(res, 400, { error: 'Enter a valid email and password.' });
         const user = store.users.find(u => u.email.toLowerCase() === body.email.trim().toLowerCase());
         if (!user || !verifyPassword(body.password, user.passwordHash)) return json(res, 401, { error: 'Email or password is incorrect.' });
-        const token = crypto.randomBytes(32).toString('hex');
-        sessions.set(token, { userId: user.id, expiresAt: Date.now() + 7 * 86400000 });
+        const token = createSession(user.id);
         res.setHeader('Set-Cookie', `bl_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`);
         return json(res, 200, { user: publicUser(user) });
       }
       if (route === '/api/auth/logout' && req.method === 'POST') {
-        const token = parseCookies(req).bl_session; sessions.delete(token);
+        const token = parseCookies(req).bl_session;
         res.setHeader('Set-Cookie', 'bl_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0'); return json(res, 200, { ok: true });
       }
       const token = parseCookies(req).bl_session;
-      const session = sessions.get(token);
-      const user = session && session.expiresAt > Date.now() ? getUser(session.userId) : null;
+      const session = readSession(token);
+      const user = session ? getUser(session.userId) : null;
       if (!user) return json(res, 401, { error: 'Please sign in to continue.' });
       if (route === '/api/auth/me' && req.method === 'GET') return json(res, 200, { user: publicUser(user) });
-      if (route === '/api/events' && req.method === 'GET') {
-        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
-        res.write(`event: connected\ndata: ${JSON.stringify({ ok: true })}\n\n`);
-        streams.set(res, { role: user.role, authorId: user.id });
-        const keepalive = setInterval(() => res.write(': keepalive\n\n'), 25000);
-        req.on('close', () => { clearInterval(keepalive); streams.delete(res); });
-        return;
-      }
+      if (route === '/api/events' && req.method === 'GET') return json(res, 200, { ok: true, mode: 'polling' });
       if (route === '/api/books' && req.method === 'GET') {
         const books = user.role === 'admin' ? store.books : store.books.filter(b => b.authorId === user.id);
         return json(res, 200, { books });
@@ -257,7 +295,9 @@ const server = http.createServer(async (req, res) => {
         if (!validString(body.subject, 3, 160)) return json(res, 400, { error: 'Subject must be between 3 and 160 characters.' });
         if (!validString(body.description, 10, 5000)) return json(res, 400, { error: 'Description must be between 10 and 5,000 characters.' });
         const ticket = { id: uid('tkt'), authorId: user.id, bookId: book?.id || null, bookTitle: book?.title || GENERAL_BOOK, subject: body.subject.trim(), description: body.description.trim(), category: classifyFallback(`${body.subject}\n${body.description}`), priority: priorityFallback(`${body.subject}\n${body.description}`), status: 'Open', createdAt: now(), updatedAt: now(), assignedTo: null, aiState: 'processing', aiReason: 'AI classification is in progress.', messages: [{ id: uid('msg'), senderId: user.id, senderName: user.name, senderRole: user.role, body: body.description.trim(), createdAt: now() }] };
-        store.tickets.push(ticket); save(); publish(ticket); enrichTicket(ticket).catch(() => {});
+        store.tickets.push(ticket); await save(); publish(ticket);
+        const classification = enrichTicket(ticket).catch(error => console.warn(`[Gemini] classification failed: ${error.message}`));
+        if (process.env.VERCEL) waitUntil(classification);
         return json(res, 201, { ticket: safeTicket(ticket, user) });
       }
       const ticketMatch = route.match(/^\/api\/tickets\/([^/]+)(?:\/(reply|notes|draft))?$/);
@@ -279,14 +319,14 @@ const server = http.createServer(async (req, res) => {
           const message = { id: uid('msg'), senderId: user.id, senderName: user.name, senderRole: user.role, body: body.body.trim(), createdAt: now() };
           ticket.messages.push(message); ticket.updatedAt = now();
           if (user.role === 'admin' && ['Resolved', 'Closed'].includes(ticket.status)) ticket.status = 'In Progress';
-          save(); publish(ticket);
+          await save(); publish(ticket);
           return json(res, 201, { ticket: safeTicket(ticket, user), message });
         }
         if (action === 'notes' && req.method === 'POST' && user.role === 'admin') {
           const body = await readBody(req);
           if (!validString(body.body, 1, 3000)) return json(res, 400, { error: 'Internal note must be between 1 and 3,000 characters.' });
           const note = { id: uid('note'), ticketId: id, authorId: user.id, authorName: user.name, body: body.body.trim(), createdAt: now() };
-          store.notes.push(note); ticket.updatedAt = now(); save(); publish(ticket);
+          store.notes.push(note); ticket.updatedAt = now(); await save(); publish(ticket);
           return json(res, 201, { note });
         }
         if (!action && req.method === 'PATCH' && user.role === 'admin') {
@@ -299,7 +339,7 @@ const server = http.createServer(async (req, res) => {
           if (body.category !== undefined) ticket.category = body.category;
           if (body.priority !== undefined) ticket.priority = body.priority;
           if (body.assignedTo !== undefined) ticket.assignedTo = body.assignedTo;
-          ticket.updatedAt = now(); save(); publish(ticket);
+          ticket.updatedAt = now(); await save(); publish(ticket);
           return json(res, 200, { ticket: safeTicket(ticket, user) });
         }
       }
@@ -321,5 +361,37 @@ const server = http.createServer(async (req, res) => {
     if (!res.headersSent) json(res, status, { error: status === 500 ? 'Something went wrong. Please try again.' : error.message });
     else res.end();
   }
+}
+
+const server = http.createServer(async (req, res) => {
+  if (process.env.VERCEL && !pool) return json(res, 503, { error: 'Database is not configured. Add DATABASE_URL in Vercel project settings.' });
+  if (process.env.VERCEL && (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32)) return json(res, 503, { error: 'Set a strong SESSION_SECRET in Vercel project settings.' });
+  if (!pool) return requestContext.run({ data: localStore }, () => handleRequest(req, res));
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query('CREATE TABLE IF NOT EXISTS bookleaf_state (id integer PRIMARY KEY CHECK (id = 1), payload jsonb NOT NULL)');
+    const route = new URL(req.url, `http://${req.headers.host || 'localhost'}`).pathname;
+    const mutating = !['GET', 'HEAD', 'OPTIONS'].includes(req.method) && !['/api/auth/login', '/api/auth/logout'].includes(route) && !route.endsWith('/draft');
+    if (mutating) await client.query('BEGIN');
+    let result = await client.query(`SELECT payload FROM bookleaf_state WHERE id = 1${mutating ? ' FOR UPDATE' : ''}`);
+    if (!result.rows.length) {
+      await client.query('INSERT INTO bookleaf_state (id, payload) VALUES (1, $1::jsonb) ON CONFLICT (id) DO NOTHING', [JSON.stringify(createSeedStore())]);
+      result = await client.query('SELECT payload FROM bookleaf_state WHERE id = 1 FOR UPDATE');
+    }
+    await requestContext.run({ data: result.rows[0].payload, client }, async () => {
+      try { await handleRequest(req, res); if (mutating) await client.query('COMMIT'); }
+      catch (error) { if (mutating) await client.query('ROLLBACK'); throw error; }
+    });
+  } catch (error) {
+    console.error('Request/database error:', error.message);
+    if (!res.headersSent) json(res, 503, { error: 'The database is temporarily unavailable. Please try again.' });
+    else if (!res.writableEnded) res.end();
+  } finally { client?.release(); }
 });
-server.listen(PORT, () => console.log(`BookLeaf Support Desk running at http://localhost:${PORT}`));
+
+if (require.main === module) {
+  server.listen(PORT, () => console.log(`BookLeaf Support Desk running at http://localhost:${PORT}`));
+} else {
+  module.exports = (req, res) => server.emit('request', req, res);
+}
