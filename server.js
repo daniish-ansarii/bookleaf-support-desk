@@ -97,9 +97,9 @@ function loadStore() {
     return existing.schemaVersion === 2 ? existing : createSeedStore();
   } catch { return createSeedStore(); }
 }
-const localStore = loadStore();
+const localStore = pool ? null : loadStore();
 const store = new Proxy({}, {
-  get(_target, key) { return requestContext.getStore()?.data?.[key] ?? localStore[key]; },
+  get(_target, key) { return requestContext.getStore()?.data?.[key] ?? localStore?.[key]; },
   set(_target, key, value) { const context = requestContext.getStore(); if (context) context.data[key] = value; else localStore[key] = value; return true; }
 });
 async function save() {

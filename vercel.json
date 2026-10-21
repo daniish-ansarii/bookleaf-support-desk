@@ -1,9 +1,12 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "outputDirectory": "public",
   "functions": {
     "api/[...all].js": {
       "maxDuration": 60,
-      "regions": ["cle1"]
+      "regions": ["cle1"],
+      "includeFiles": "knowledge-base.md"
     }
   }
 }
