@@ -2,8 +2,14 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": null,
   "outputDirectory": "public",
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "/api/index?__path=:path*"
+    }
+  ],
   "functions": {
-    "api/[...all].js": {
+    "api/index.js": {
       "maxDuration": 60,
       "regions": ["cle1"],
       "includeFiles": "knowledge-base.md"
